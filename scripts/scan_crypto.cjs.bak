@@ -39,26 +39,16 @@ function fetchJson(url) {
  */
 function calculateRSI(closes) {
   if (closes.length < 15) return 50;
-  
-  // Use the LAST 15 closes (not the first!)
-  const recentCloses = closes.slice(-15);
-  
   let gains = 0, losses = 0;
-  for (let i = 1; i < recentCloses.length; i++) {
-    const diff = recentCloses[i] - recentCloses[i - 1];
+  for (let i = 1; i < 15; i++) {
+    const diff = closes[i] - closes[i - 1];
     if (diff > 0) gains += diff;
     else losses -= diff;
   }
-  
   const avgGain = gains / 14;
   const avgLoss = losses / 14;
-  
-  // Handle edge cases
-  if (avgLoss === 0) return avgGain === 0 ? 50 : 100;
-  if (avgGain === 0) return 0;
-  
-  const rs = avgGain / avgLoss;
-  return 100 - (100 / (1 + rs));
+  if (avgLoss === 0) return 100;
+  return 100 - (100 / (1 + avgGain / avgLoss));
 }
 
 /**
