@@ -1,8 +1,9 @@
-const https = require('https'); const fs = require('fs');
+const https = require('https'); 
+const fs = require('fs');
 const { execSync } = require('child_process');
+const { RSI, BollingerBands, MACD, OBV, VWAP } = require('technicalindicators');
 
 const EMAIL_TO = 'ai.study.learning@gmail.com';
-
 
 // ─── Scoring thresholds ────────────────────────────────────────────────────
 // Score breakdown (max 9):
@@ -31,123 +32,91 @@ function fetchJson(url) {
   });
 }
 
-// ─── Technical Indicators ─────────────────────────────────────────────────
+// ─── Technical Indicators using technicalindicators library ───────────────
 
-/**
- * Standard 14-period RSI using simple average (Wilder's first-period method).
- * Requires at least 15 closes.
- */
-function calculateRSI(closes) {
-  if (closes.length < 15) return 50;
-  
-  // Use the LAST 15 closes (not the first!)
-  const recentCloses = closes.slice(-15);
-  
-  let gains = 0, losses = 0;
-  for (let i = 1; i < recentCloses.length; i++) {
-    const diff = recentCloses[i] - recentCloses[i - 1];
-    if (diff > 0) gains += diff;
-    else losses -= diff;
-  }
-  
-  const avgGain = gains / 14;
-  const avgLoss = losses / 14;
-  
-  // Handle edge cases
-  if (avgLoss === 0) return avgGain === 0 ? 50 : 100;
-  if (avgGain === 0) return 0;
-  
-  const rs = avgGain / avgLoss;
-  return 100 - (100 / (1 + rs));
-}
-
-/**
- * On-Balance Volume (OBV).
- * Returns true if OBV has been rising over the last `lookback` periods —
- * a sign of accumulation even while price is low.
- */
 function isOBVRising(closes, volumes, lookback = 5) {
-  if (closes.length < lookback + 1 || volumes.length < lookback + 1) return false;
-  const obv = [0];
-  for (let i = 1; i < closes.length; i++) {
-    if (closes[i] > closes[i - 1])      obv.push(obv[i - 1] + volumes[i]);
-    else if (closes[i] < closes[i - 1]) obv.push(obv[i - 1] - volumes[i]);
-    else                                 obv.push(obv[i - 1]);
-  }
-  // Compare average of last `lookback` periods vs the period before
-  const recent = obv.slice(-lookback).reduce((a, b) => a + b, 0) / lookback;
-  const prior  = obv.slice(-lookback * 2, -lookback).reduce((a, b) => a + b, 0) / lookback;
+  if (closes.length < lookback * 2 + 1 || volumes.length < lookback * 2 + 1) return false;
+  
+  const obvResult = OBV.calculate({
+    close: closes,
+    volume: volumes
+  });
+  
+  if (obvResult.length < lookback * 2) return false;
+  
+  const recent = obvResult.slice(-lookback).reduce((a, b) => a + b, 0) / lookback;
+  const prior = obvResult.slice(-lookback * 2, -lookback).reduce((a, b) => a + b, 0) / lookback;
   return recent > prior;
 }
 
-/**
- * Volume-Weighted Average Price (VWAP) over all provided candles.
- * Returns true if the current (last) close is below VWAP.
- */
 function isPriceBelowVWAP(closes, highs, lows, volumes) {
-  let cumTPV = 0, cumVol = 0;
-  for (let i = 0; i < closes.length; i++) {
-    const typicalPrice = (highs[i] + lows[i] + closes[i]) / 3;
-    cumTPV += typicalPrice * volumes[i];
-    cumVol += volumes[i];
-  }
-  if (cumVol === 0) return false;
-  const vwap = cumTPV / cumVol;
-  return closes[closes.length - 1] < vwap;
+  if (closes.length === 0) return false;
+  
+  const vwapResult = VWAP.calculate({
+    high: highs,
+    low: lows,
+    close: closes,
+    volume: volumes
+  });
+  
+  if (vwapResult.length === 0) return false;
+  
+  const currentVWAP = vwapResult[vwapResult.length - 1];
+  const currentClose = closes[closes.length - 1];
+  
+  return currentClose < currentVWAP;
 }
 
-/**
- * Bollinger Band squeeze detector.
- * A squeeze means the band width is at its narrowest in `lookback` periods —
- * a sign that a large move is imminent. Combine with RSI < 25 for high quality.
- */
 function isBollingerSqueeze(closes, period = 14, lookback = 5) {
   if (closes.length < period + lookback) return false;
 
-  function bandWidth(slice) {
-    const mean = slice.reduce((a, b) => a + b, 0) / slice.length;
-    const variance = slice.reduce((a, b) => a + (b - mean) ** 2, 0) / slice.length;
-    const stdDev = Math.sqrt(variance);
-    return (stdDev * 2) / mean; // normalised width
+  function getBandWidth(slice) {
+    const bbResult = BollingerBands.calculate({
+      period: period,
+      values: slice,
+      stdDev: 2
+    });
+    
+    if (bbResult.length === 0) return null;
+    
+    const lastBB = bbResult[bbResult.length - 1];
+    const width = (lastBB.upper - lastBB.lower) / lastBB.middle;
+    return width;
   }
 
-  const currentWidth = bandWidth(closes.slice(-period));
+  const currentWidth = getBandWidth(closes.slice(-period));
+  if (currentWidth === null) return false;
+  
   let isNarrowest = true;
   for (let i = 1; i <= lookback; i++) {
-    const prevWidth = bandWidth(closes.slice(-period - i, -i));
-    if (prevWidth <= currentWidth) { isNarrowest = false; break; }
+    const prevWidth = getBandWidth(closes.slice(-period - i, -i));
+    if (prevWidth === null || prevWidth <= currentWidth) {
+      isNarrowest = false;
+      break;
+    }
   }
   return isNarrowest;
 }
 
-/**
- * Simple MACD bullish crossover detector.
- * Returns true if the MACD line just crossed above the signal line.
- */
-function isMACDBullishCross(closes, fast = 12, slow = 26, signal = 9) {
-  if (closes.length < slow + signal) return false;
-
-  function ema(data, period) {
-    const k = 2 / (period + 1);
-    let result = data[0];
-    for (let i = 1; i < data.length; i++) {
-      result = data[i] * k + result * (1 - k);
-    }
-    return result;
-  }
-
-  // Build MACD line over last (signal + 1) points so we can compare prev vs current
-  const macdLine = [];
-  for (let i = closes.length - signal - 1; i < closes.length; i++) {
-    const slice = closes.slice(0, i + 1);
-    macdLine.push(ema(slice.slice(-slow), fast) - ema(slice.slice(-slow), slow));
-  }
-
-  const signalLine = macdLine.slice(-signal).reduce((a, b) => a + b, 0) / signal;
-  const prevMACD   = macdLine[macdLine.length - 2];
-  const currMACD   = macdLine[macdLine.length - 1];
-
-  return prevMACD < signalLine && currMACD >= signalLine;
+function isMACDBullishCross(closes) {
+  if (closes.length < 35) return false; // Need at least 26 + 9 periods
+  
+  const macdResult = MACD.calculate({
+    values: closes,
+    fastPeriod: 12,
+    slowPeriod: 26,
+    signalPeriod: 9,
+    SimpleMAOscillator: false,
+    SimpleMASignal: false
+  });
+  
+  if (macdResult.length < 2) return false;
+  
+  const prev = macdResult[macdResult.length - 2];
+  const curr = macdResult[macdResult.length - 1];
+  
+  // Bullish cross: MACD line crosses above signal line
+  return prev.MACD < prev.signal && curr.MACD >= curr.signal;
 }
 
 // ─── Scoring ──────────────────────────────────────────────────────────────
@@ -156,7 +125,14 @@ function scoreAsset({ closes, highs, lows, volumes }) {
   let score = 0;
   const signals = [];
 
-  const rsi = calculateRSI(closes);
+  // Calculate RSI using technicalindicators library
+  const rsiResult = RSI.calculate({
+    values: closes,
+    period: 14
+  });
+  
+  const rsi = rsiResult.length > 0 ? rsiResult[rsiResult.length - 1] : 50;
+  
   if (rsi < RSI_OVERSOLD) {
     score += 1;
     signals.push(`RSI ${rsi.toFixed(1)} (oversold)`);
@@ -204,9 +180,9 @@ async function run() {
       try {
         // Fetch 30 candles so MACD and Bollinger lookbacks have enough data
         const klines = await fetchJson(
-          `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=30`
+          `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=40`
         );
-        if (klines.length < 27) continue;
+        if (klines.length < 35) continue;
 
         const closes  = klines.map(k => parseFloat(k[4]));
         const highs   = klines.map(k => parseFloat(k[2]));
@@ -276,7 +252,7 @@ async function run() {
             <tbody>${htmlRows}</tbody>
           </table>
           <p style="font-size:11px;color:#999;margin-top:24px;text-align:center;">
-            Generated by OpenClaw Trading Bot · Composite scoring v2
+            Generated by OpenClaw Trading Bot · Using technicalindicators library
           </p>
         </div>
       `.replace(/\n/g, ' ');
